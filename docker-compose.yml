@@ -1,0 +1,20 @@
+services:
+  localstack:
+    container_name: localstack_main
+    image: localstack/localstack:latest
+
+    ports:
+      # Puerto principal de la API
+      - "127.0.0.1:4566:4566"
+      # Rango para servicios específicos externos
+      - "127.0.0.1:4510-4559:4510-4559"
+
+    environment:
+      # Servicios a habilitar
+      - SERVICES=sns,sqs
+      - DEBUG=1
+      - DOCKER_HOST=unix:///var/run/docker.sock
+
+    volumes:
+      - "./volume:/var/lib/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
