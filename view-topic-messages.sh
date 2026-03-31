@@ -24,8 +24,8 @@ else
   TOPIC_PREFIX="${TENANT}"
 fi
 
-# Topic específico por evento
-TOPIC_NAME="${TOPIC_PREFIX}_auth_person_email-changed.fifo"
+# Topic (mismo nombre que usa node-api: sin .fifo)
+TOPIC_NAME="${TOPIC_PREFIX}_auth_person_emailchanged"
 TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:${TOPIC_NAME}"
 
 echo "📋 Suscripciones del topic: $TOPIC_ARN"
@@ -51,7 +51,7 @@ for QUEUE_ARN in $SUBSCRIPTIONS; do
   QUEUE_NAME=$(echo $QUEUE_ARN | awk -F: '{print $NF}')
   
   # Construir URL de la queue (ambos formatos funcionan)
-  QUEUE_URL="http://sqs.us-east-1.localhost.localstack.cloud:4566/${ACCOUNT_ID}/${QUEUE_NAME}"
+  QUEUE_URL="http://sqs.${REGION}.localhost.localstack.cloud:4566/${ACCOUNT_ID}/${QUEUE_NAME}"
   
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo "📬 Queue: $QUEUE_NAME"

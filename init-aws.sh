@@ -26,19 +26,20 @@ else
   TOPIC_PREFIX="${TENANT}"
 fi
 
-# Topic específico por evento
-# Formato: ${TOPIC_PREFIX}_${suffix}.fifo
+# Topics por evento (nombre exacto que usa node-api en getParamsToSendSNS)
+# node-api publica a: AWS_SNS_TOPIC_ARN_BASE + topic = .../celutnba_dev_auth_person_emailchanged (sin .fifo)
 EVENT_TOPICS=(
-  "${TOPIC_PREFIX}_auth_person_email-changed.fifo"
+  "${TOPIC_PREFIX}_auth_person_emailchanged"
 )
 
-# Lista de suscriptores (servicios que escuchan el evento)
+# Suscriptores del evento auth_person_emailchanged (queueName en EVENTS.yml con prefijo aplicado)
+# Debe coincidir con node-api/src/config/EVENTS.yml
 SUBSCRIBERS=(
-  "keycloak"
-  "permit"
-  "lms"
-  "sigead"
-  "participations"
+  "lms_person_emailchanged"
+  "participations_person_emailchanged"
+  "auth_person_permitemailchanged"
+  "auth_person_keycloakemailchanged"
+  "sigead_person_emailchanged"
 )
 
 echo ""
@@ -53,16 +54,13 @@ echo "  - Topic Prefix: ${TOPIC_PREFIX}"
 echo ""
 
 # ============================
-# 1. Crear los Topics SNS (FIFO)
+# 1. Crear los Topics SNS (estándar, sin FIFO - como los usa node-api para custom topics)
 # ============================
-# Crear topics específicos por evento
 for event_topic in "${EVENT_TOPICS[@]}"; do
   EVENT_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:${event_topic}"
   echo ""
   echo "Creando Topic SNS: ${event_topic}"
-  awslocal sns create-topic \
-    --name "${event_topic}" \
-    --attributes FifoTopic=true,ContentBasedDeduplication=true
+  awslocal sns create-topic --name "${event_topic}"
 
   if [ $? -eq 0 ]; then
     echo "✓ Topic creado exitosamente"
@@ -72,36 +70,20 @@ for event_topic in "${EVENT_TOPICS[@]}"; do
 done
 
 # ============================
-# 2. Crear Queues y Suscripciones
+# 2. Crear Queues (estándar) y Suscripciones
 # ============================
-# Para cada topic de evento, crear las queues y suscripciones correspondientes
+# Un topic SNS estándar solo puede tener suscripciones a colas SQS estándar (no FIFO)
 for event_topic in "${EVENT_TOPICS[@]}"; do
   EVENT_TOPIC_ARN="arn:aws:sns:${REGION}:${ACCOUNT_ID}:${event_topic}"
-  
-  # Extraer el suffix del topic eliminando el prefijo y el servicio que publica
-  # Ejemplo: "celutnba_dev_auth_person_email-changed.fifo" -> "person_email-changed"
-  EVENT_SUFFIX="${event_topic#${TOPIC_PREFIX}_}"
-  EVENT_SUFFIX="${EVENT_SUFFIX%.fifo}"
-  # Eliminar el primer segmento (servicio que publica, ej: "auth_")
-  EVENT_SUFFIX="${EVENT_SUFFIX#*_}"
-  
+
   echo ""
   echo "=========================================="
   echo "Configurando topic de evento: ${event_topic}"
   echo "=========================================="
-  
+
   for sub in "${SUBSCRIBERS[@]}"; do
-    # Determinar el formato del nombre de la queue según el suscriptor
-    # keycloak y permit usan formato especial: ${TOPIC_PREFIX}_auth_person_${sub}-email-changed.fifo
-    # Los demás usan formato estándar: ${TOPIC_PREFIX}_${sub}_${EVENT_SUFFIX}.fifo
-    if [ "${sub}" = "keycloak" ] || [ "${sub}" = "permit" ]; then
-      # Formato especial: celutnba_dev_auth_person_keycloak-email-changed.fifo
-      QUEUE_NAME="${TOPIC_PREFIX}_auth_person_${sub}-email-changed.fifo"
-    else
-      # Formato estándar: celutnba_dev_lms_person_email-changed.fifo
-      QUEUE_NAME="${TOPIC_PREFIX}_${sub}_${EVENT_SUFFIX}.fifo"
-    fi
-    
+    # Nombre de cola = topicPrefix + queueName (igual que en events.js: topicPrefix_lms_person_emailchanged)
+    QUEUE_NAME="${TOPIC_PREFIX}_${sub}"
     QUEUE_ARN="arn:aws:sqs:${REGION}:${ACCOUNT_ID}:${QUEUE_NAME}"
     QUEUE_URL="http://sqs.${REGION}.localhost.localstack.cloud:4566/${ACCOUNT_ID}/${QUEUE_NAME}"
 
@@ -109,10 +91,8 @@ for event_topic in "${EVENT_TOPICS[@]}"; do
     echo "Configurando suscriptor: ${sub}"
     echo "  - Queue Name: ${QUEUE_NAME}"
 
-    # Crear la Queue SQS (FIFO)
-    awslocal sqs create-queue \
-      --queue-name "${QUEUE_NAME}" \
-      --attributes FifoQueue=true,ContentBasedDeduplication=true
+    # Crear la Queue SQS estándar (topic SNS estándar no admite colas FIFO)
+    awslocal sqs create-queue --queue-name "${QUEUE_NAME}"
 
     if [ $? -eq 0 ]; then
       echo "  ✓ Queue creada exitosamente"
@@ -120,19 +100,32 @@ for event_topic in "${EVENT_TOPICS[@]}"; do
       echo "  ✗ Error al crear la queue (puede que ya exista)"
     fi
 
-    # Suscribir la Queue al Topic SNS específico del evento
-    awslocal sns subscribe \
+    # Suscribir la Queue al Topic SNS
+    # Sin RawMessageDelivery, el Body en SQS es el envoltorio SNS (Type, TopicArn, Message como string);
+    # sofia-deco espera el JSON publicado en la raíz (p. ej. message.topic) — igual que con raw delivery en AWS.
+    SUBSCRIPTION_ARN=$(awslocal sns subscribe \
       --topic-arn "${EVENT_TOPIC_ARN}" \
       --protocol sqs \
-      --notification-endpoint "${QUEUE_ARN}"
+      --notification-endpoint "${QUEUE_ARN}" \
+      --query 'SubscriptionArn' --output text 2>/dev/null)
 
-    if [ $? -eq 0 ]; then
+    if [ -n "${SUBSCRIPTION_ARN}" ] && [ "${SUBSCRIPTION_ARN}" != "None" ]; then
       echo "  ✓ Suscripción creada exitosamente"
+      awslocal sns set-subscription-attributes \
+        --subscription-arn "${SUBSCRIPTION_ARN}" \
+        --attribute-name RawMessageDelivery \
+        --attribute-value true
+      if [ $? -eq 0 ]; then
+        echo "  ✓ RawMessageDelivery=true (payload directo en SQS, compatible con NotificationService)"
+      else
+        echo "  ✗ Error al habilitar RawMessageDelivery"
+      fi
     else
-      echo "  ✗ Error al crear la suscripción"
+      echo "  ✗ Error al crear la suscripción (puede que ya exista sin raw delivery)"
+      echo "     Si el consumer sigue viendo topic undefined: elimina la suscripción antigua o borra el volumen de LocalStack y vuelve a ejecutar este script."
     fi
 
-    # Aplicar política para permitir que SNS envíe mensajes a SQS
+    # Política para permitir que SNS envíe mensajes a SQS
     awslocal sqs set-queue-attributes \
       --queue-url "${QUEUE_URL}" \
       --attributes "{
@@ -152,6 +145,21 @@ for event_topic in "${EVENT_TOPICS[@]}"; do
     else
       echo "  ✗ Error al aplicar la política"
     fi
+  done
+
+  # Idempotente: suscripciones creadas antes (sin raw delivery) siguen enviando el envoltorio SNS
+  echo ""
+  echo "Sincronizando RawMessageDelivery en suscripciones SQS existentes del topic: ${event_topic}"
+  EXISTING_SUBS=$(awslocal sns list-subscriptions-by-topic \
+    --topic-arn "${EVENT_TOPIC_ARN}" \
+    --query 'Subscriptions[?Protocol==`sqs`].SubscriptionArn' --output text 2>/dev/null || true)
+  for sub_arn in ${EXISTING_SUBS}; do
+    [ -z "${sub_arn}" ] && continue
+    awslocal sns set-subscription-attributes \
+      --subscription-arn "${sub_arn}" \
+      --attribute-name RawMessageDelivery \
+      --attribute-value true \
+      && echo "  ✓ RawMessageDelivery en ${sub_arn}"
   done
 done
 
